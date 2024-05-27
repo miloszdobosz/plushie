@@ -1,9 +1,12 @@
+import os
+import shutil
 import threading
 import time
 from queue import Queue
 
 import numpy as np
 import sounddevice as sd
+import wave
 from rich.console import Console
 
 import ollama
@@ -12,12 +15,12 @@ from piper.voice import PiperVoice
 
 
 SAMPLERATE = 16000
+MIN_DURATION = 1
 SILENCE_GAP = 1
 SILENCE_THRESHOLD = 100
 
 console = Console()
 listener = whisper.load_model("medium.en")
-# listener = whisper.load_model("base.en")
 speaker = PiperVoice.load('en_US-amy-medium.onnx', config_path='en_US-amy-medium.onnx.json')
 output = sd.OutputStream(samplerate=speaker.config.sample_rate, channels=1, dtype='int16')
 output.start()
@@ -29,10 +32,14 @@ output.start()
 # ollama.create(model='plushie', modelfile=modelfile)
 
 
+# def clear_recordings_directory(directory):
+#     if os.path.exists(directory):
+#         shutil.rmtree(directory)
+#     os.makedirs(directory)
 
+# recording_id = 0
 
-silent = 0
-def record_audio(stop_event, data_queue):
+def record_audio(stop_event, recorded_queue):
     """
     Captures audio data from the user's microphone and adds it to a queue for further processing.
 
@@ -44,36 +51,50 @@ def record_audio(stop_event, data_queue):
         None
     """
 
-    def callback(indata, frames, time, status):
-        # print(frames)
-        # print(list(indata))
-        # print(indata)
-        # print(np.frombuffer(bytes(indata), dtype="int16").astype("int32")**2)
-        global silent
-        mean = np.sqrt(np.mean(indata.astype("int32")**2))
-        if (mean > SILENCE_THRESHOLD):
-            silent = 0
-            print(mean)
-            data_queue.put(bytes(indata))
-        else:
-            silent += frames
-        if (silent > SILENCE_GAP * SAMPLERATE) and not stop_event.is_set():
-            stop_event.set()
-            silent = 0
-            print("stop")
-        if status:
-            console.print(status)
+    stream = Queue()
+    silent_samples = 0
+    loud_samples = 0
 
-    with sd.InputStream(
-        samplerate=SAMPLERATE, dtype="int16", channels=1, callback=callback
-    ):
-        while not stop_event.is_set():
-            time.sleep(0.1)
-    # with sd.RawInputStream(
-    #     samplerate=16000, dtype="int16", channels=1, callback=callback
-    # ):
-    #     while not stop_event.is_set():
-    #         time.sleep(0.1)
+    def callback(indata, frames, _time, _status):
+        nonlocal stream, silent_samples, loud_samples
+        # global recording_id
+
+        # RMS volume
+        volume = np.sqrt(np.mean(np.frombuffer(indata, dtype="int16").astype("int32")**2))
+
+        if (volume > SILENCE_THRESHOLD):
+            # print(volume)
+            console.print(f'[green]\r{"█" * int(volume / 200)}')
+
+            silent_samples = 0
+            loud_samples += frames
+
+            stream.put(bytes(indata)) 
+
+        else:
+            silent_samples += frames
+
+            if (silent_samples > SILENCE_GAP * SAMPLERATE):
+                # Cut a prompt
+                audio_data = b"".join(stream.queue)
+                
+                if loud_samples > MIN_DURATION * SAMPLERATE:
+                    recorded_queue.put(np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0)
+                    loud_samples = 0
+
+                    # # Save to WAV file using wave library
+                    # recording_id += 1
+                    # with wave.open(f'recordings/{recording_id}.wav', 'wb') as wf:
+                    #     wf.setnchannels(1)
+                    #     wf.setsampwidth(2)  # 2 bytes for 'int16'
+                    #     wf.setframerate(SAMPLERATE)
+                    #     wf.writeframes(audio_data)
+                
+                silent_samples = 0
+                stream = Queue()
+
+    with sd.RawInputStream(samplerate=SAMPLERATE, dtype="int16", channels=1, callback=callback):
+        stop_event.wait()
 
 
 def transcribe(audio_np: np.ndarray) -> str:
@@ -90,77 +111,68 @@ def transcribe(audio_np: np.ndarray) -> str:
     text = result["text"].strip()
     return text
 
+def say(text: str):
+    for audio_bytes in speaker.synthesize_stream_raw(text):
+        output.write(np.frombuffer(audio_bytes, dtype=np.int16))
 
+def is_sentence(text: str) -> bool:
+    return len(text) > 1 and (text[-1] == '.' and not text[-2].isdigit() or text[-1] in {'!', '?'})
 
 if __name__ == "__main__":
     console.print("[cyan]Plushie woke up! Press Ctrl+C to put it to sleep.")
 
+    # clear_recordings_directory("recordings")
+    stop_event = threading.Event()
+
     try:
         while True:
-            # console.input(
-            #     "Press Enter to start recording, then press Enter again to stop."
-            # )
-
-            data_queue = Queue()  # type: ignore[var-annotated]
-            stop_event = threading.Event()
-            recording_thread = threading.Thread(
-                target=record_audio,
-                args=(stop_event, data_queue),
-            )
+            recorded_queue = Queue()
+            recording_thread = threading.Thread(target=record_audio, args=(stop_event, recorded_queue))
             recording_thread.start()
 
-            start_time = time.time()
-            # input()
-            # stop_event.set()
-            recording_thread.join()
+            text = ""
+            while True:
+                audio = recorded_queue.get()
+                with console.status("[green]Thinking", spinner="point"):
+                    text = transcribe(audio)
 
-            audio_data = b"".join(list(data_queue.queue))
-            audio_np = (
-                np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+                    console.print(f"[green]\nYou:\n [yellow]{text}")
+
+                    if(len(text) > 4):
+                        break
+
+                console.print("[red]Ignoring short prompt (probably noise)")
+
+
+            stop_event.set()
+            stop_event.clear()
+
+            stream = ollama.chat(
+                model='plushie',
+                messages=[{'role': 'user', 'content': text}],
+                stream=True,
             )
+            sentence = ''
 
-            if audio_np.size > 0:
-                print(time.time() - start_time)
-                start_time = time.time()
-                with console.status("Absorbing...", spinner="earth"):
-                    text = transcribe(audio_np)
-                print(time.time() - start_time)
-                console.print(f"[yellow]You: {text}")
+            console.print("[green]Plushie:", end="\n ")
+            for chunk in stream:
+                content = chunk['message']['content']
+                console.print(f"[cyan]{content}", end='')
 
-                if(len(text) < 5):
-                    continue
+                sentence += content
 
-                # with console.status("Generating response...", spinner="earth"):
-                stream = ollama.chat(
-                    model='plushie',
-                    messages=[{'role': 'user', 'content': text}],
-                    stream=True,
-                )
+                if is_sentence(sentence):
+                    console.print()
 
-
-                sentence = ''
-                for chunk in stream:
-                  content = chunk['message']['content']
-                  print(content, end='', flush=True)
-                  # console.print(content, end='')
-                  sentence += content
-
-                  if len(sentence) > 1 and (sentence[-1] == '.' and not sentence[-2].isdigit() or sentence[-1] in {'!', '?'}):
-                    for audio_bytes in speaker.synthesize_stream_raw(sentence):
-                        int_data = np.frombuffer(audio_bytes, dtype=np.int16)
-                        output.write(int_data)
-                    sentence = ''
-
-            else:
-                console.print(
-                    "[red]No audio recorded. Please ensure the microphone is working."
-                )
-            print("END.")
+                    with console.status("[green]Thinking", spinner="point"):
+                        say(sentence)
+                        sentence = ''
 
     except KeyboardInterrupt:
-        console.print("\n[red]Falling asleep...")
+        with console.status("\n[green]Falling asleep", spinner="point"):
+            output.stop()
+            output.close()
 
-        output.stop()
-        output.close()
+            stop_event.set()
 
-    console.print("[blue]Sleeping.")
+    console.print("[green]\nSleeping.")
